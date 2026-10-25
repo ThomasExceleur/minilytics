@@ -43,7 +43,14 @@ export function Settings({ siteId }: { siteId: string }) {
   useEffect(() => {
     api<Site>(`/api/sites/${siteId}`).then((s) => {
       setSite(s);
-      setForm({ name: s.name, domain: s.domain, timezone: s.timezone, currency: s.currency, dodo_webhook_secret: s.dodo_webhook_secret ?? '' });
+      setForm({
+        name: s.name,
+        domain: s.domain,
+        timezone: s.timezone,
+        currency: s.currency,
+        dodo_webhook_secret: s.dodo_webhook_secret ?? '',
+        stripe_webhook_secret: s.stripe_webhook_secret ?? '',
+      });
     });
   }, [siteId]);
 
@@ -62,6 +69,7 @@ export function Settings({ siteId }: { siteId: string }) {
   if (!site) return null;
   const snippet = `<script\n  defer\n  data-website-id="${site.id}"\n  src="${origin}/js/script.js"\n></script>`;
   const webhookUrl = `${origin}/api/webhooks/dodo/${site.id}`;
+  const stripeWebhookUrl = `${origin}/api/webhooks/stripe/${site.id}`;
 
   return (
     <div className="mx-auto max-w-3xl space-y-5 px-4 py-8 sm:py-12">
@@ -193,6 +201,83 @@ const session = await dodo.checkoutSessions.create({
         </ol>
       </Section>
 
+      <Section
+        title="4. Connect Stripe (revenue attribution)"
+        desc="One-off Checkout payments, subscription charges and refunds, linked to the visitor who paid. Dodo keeps working alongside this."
+      >
+        <ol className="list-decimal space-y-4 pl-5 text-sm">
+          <li>
+            In the Stripe Dashboard → <b>Developers → Webhooks → Add endpoint</b>, use this URL and subscribe to{' '}
+            <code>checkout.session.completed</code>, <code>invoice.paid</code> and <code>charge.refunded</code>:
+            <div className="mt-2">
+              <Code>{stripeWebhookUrl}</Code>
+            </div>
+            <p className="mt-2 text-stone-500">
+              <code>checkout.session.completed</code> is the one-off Checkout payment (and carries the visitor on the first subscription checkout).{' '}
+              <code>invoice.paid</code> is the first subscription charge and every renewal. <code>charge.refunded</code> is a full or partial refund.
+              If you take delayed methods such as bank debits, also add <code>checkout.session.async_payment_succeeded</code>. Retries of the same
+              event are stored once.
+            </p>
+          </li>
+          <li>
+            Paste the endpoint's <b>signing secret</b> (starts with <code>whsec_</code>):
+            <div className="mt-2 flex gap-2">
+              <input
+                className="input font-mono"
+                type="password"
+                placeholder="whsec_..."
+                value={form.stripe_webhook_secret ?? ''}
+                onChange={(e) => setForm({ ...form, stripe_webhook_secret: e.target.value })}
+              />
+              <button className="btn-dark" onClick={() => save({ stripe_webhook_secret: form.stripe_webhook_secret ?? '' }, 'Stripe webhook secret saved')}>
+                Save
+              </button>
+            </div>
+            {site.stripe_webhook_secret && <p className="mt-1 text-xs text-emerald-600">✓ Secret configured</p>}
+          </li>
+          <li>
+            Pass the visitor cookies when you create a Checkout Session. For a subscription, copy them into{' '}
+            <code>subscription_data.metadata</code> as well — renewal invoices only have the subscription's metadata.{' '}
+            <code>client_reference_id</code> must be the <code>ml_vid</code> cookie, not your own user id.
+            <div className="mt-2">
+              <Code>{`import Stripe from 'stripe';
+import { cookies } from 'next/headers';
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!);
+const jar = await cookies();
+const visitorId = jar.get('ml_vid')?.value ?? '';
+const sessionId = jar.get('ml_sid')?.value ?? '';
+
+const session = await stripe.checkout.sessions.create({
+  mode: 'subscription', // 'payment' for a one-off — then omit subscription_data
+  line_items: [{ price: 'price_xxx', quantity: 1 }],
+  success_url: 'https://${site.domain}/thanks?session_id={CHECKOUT_SESSION_ID}',
+  cancel_url: 'https://${site.domain}/pricing',
+  client_reference_id: visitorId,
+  metadata: {
+    ml_visitor_id: visitorId,
+    ml_session_id: sessionId,
+  },
+  subscription_data: {
+    metadata: {
+      ml_visitor_id: visitorId,
+      ml_session_id: sessionId,
+    },
+  },
+});`}</Code>
+            </div>
+            <p className="mt-2 text-stone-500">
+              <code>success_url</code> has to be a page on your site that loads the script, and it has to keep{' '}
+              <code>session_id={'{CHECKOUT_SESSION_ID}'}</code> (Stripe replaces the braces). That links the payment when metadata is missing.
+              The same fallbacks as Dodo still apply: an earlier payment by the same Stripe customer, an email you <code>identify()</code>'d, and
+              checkout-click timing when exactly one visitor opened Checkout or a Payment Link shortly before paying. Stripe Payment Links
+              (<code>buy.stripe.com</code>) get <code>client_reference_id</code> from the script automatically. Set this site's currency to the one
+              you charge in.
+            </p>
+          </li>
+        </ol>
+      </Section>
+
       <Section title="Other payment providers / server-side API" desc="Send payments or goals from your backend using this site's API key.">
         <div className="mb-3 flex gap-2">
           <input className="input font-mono" readOnly value={site.api_key} />
@@ -277,7 +362,7 @@ function AiSetup({ site, origin }: { site: Site; origin: string }) {
         <div>
           <h2 className="text-lg font-semibold">✨ Set up with AI</h2>
           <p className="mt-1 max-w-lg text-sm text-stone-600">
-            Copy this prompt into Claude Code, Cursor or any coding AI opened in your project. It installs the script, connects Dodo Payments
+            Copy this prompt into Claude Code, Cursor or any coding AI opened in your project. It installs the script, connects Dodo or Stripe
             attribution, identifies users and adds button goals, using this site's real values. It asks you only what it can't find in your code.
           </p>
         </div>
@@ -297,7 +382,7 @@ function AiSetup({ site, origin }: { site: Site; origin: string }) {
       </button>
       {open && <pre className="code mt-3 max-h-96 whitespace-pre-wrap">{prompt}</pre>}
       <p className="mt-3 text-xs text-stone-500">
-        The AI handles the code. You still connect the Dodo webhook yourself (step 3 below), because that's done in Dodo's dashboard.
+        The AI handles the code. You still connect the payment webhook yourself (Dodo in step 3, or Stripe in step 4).
       </p>
     </section>
   );

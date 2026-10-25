@@ -175,12 +175,13 @@ export async function ingest(
 }
 
 /**
- * Dodo sends buyers back to your return URL with ?payment_id=pay_... . Seeing that on a pageview tells us
- * exactly which visitor made the payment, even when the checkout had no metadata.
+ * The return page tells us which visitor paid when checkout metadata is missing.
+ * Dodo adds ?payment_id=pay_... or ?subscription_id=sub_... . Stripe Checkout doesn't, so the success URL
+ * should keep ?session_id={CHECKOUT_SESSION_ID} (cs_...).
  */
 function claimPayment(db: D1Database, siteId: string, vid: string, url: URL, now: number): D1PreparedStatement[] {
-  const paymentId = url.searchParams.get('payment_id') ?? url.searchParams.get('subscription_id');
-  if (!paymentId || !/^(pay|sub)_[\w-]{4,64}$/.test(paymentId)) return [];
+  const paymentId = url.searchParams.get('payment_id') ?? url.searchParams.get('subscription_id') ?? url.searchParams.get('session_id');
+  if (!paymentId || !/^(pay|sub|cs|pi|in)_[\w-]{4,255}$/.test(paymentId)) return [];
   return [
     db
       .prepare('INSERT OR IGNORE INTO payment_claims (site_id, payment_id, visitor_id, ts) VALUES (?, ?, ?, ?)')
@@ -190,9 +191,9 @@ function claimPayment(db: D1Database, siteId: string, vid: string, url: URL, now
       .prepare(
         `UPDATE payments SET visitor_id = ?, matched_by = 'return_page',
            session_id = (${creditedSessionSql()})
-         WHERE site_id = ? AND (id = ? OR subscription_id = ?) AND visitor_id IS NULL`,
+         WHERE site_id = ? AND (id = ? OR subscription_id = ? OR checkout_session_id = ?) AND visitor_id IS NULL`,
       )
-      .bind(vid, siteId, vid, now + 60_000, siteId, paymentId, paymentId),
+      .bind(vid, siteId, vid, now + 60_000, siteId, paymentId, paymentId, paymentId),
     db
       .prepare(
         `UPDATE visitors SET email = COALESCE(email, (SELECT email FROM payments WHERE site_id = ? AND (id = ? OR subscription_id = ?) LIMIT 1)),
