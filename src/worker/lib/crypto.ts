@@ -18,6 +18,12 @@ function bytesToB64(bytes: ArrayBuffer): string {
   return btoa(s);
 }
 
+function bytesToHex(bytes: ArrayBuffer): string {
+  let s = '';
+  for (const b of new Uint8Array(bytes)) s += b.toString(16).padStart(2, '0');
+  return s;
+}
+
 async function hmac(key: Uint8Array<ArrayBuffer>, data: string): Promise<ArrayBuffer> {
   const k = await crypto.subtle.importKey('raw', key, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
   return crypto.subtle.sign('HMAC', k, enc.encode(data));
@@ -55,6 +61,37 @@ export async function verifyStandardWebhook(
     .split(' ')
     .map((s) => s.split(',')[1] ?? '')
     .some((sig) => safeEqual(sig, expected));
+}
+
+/**
+ * Verify a Stripe webhook signature (`Stripe-Signature`).
+ * Signed payload is `${timestamp}.${rawBody}`, HMAC-SHA256 hex. The key is the endpoint secret
+ * as a raw string (`whsec_…`), not the base64 payload after the prefix (that's the Dodo scheme).
+ * Tolerance is 5 minutes, same as Stripe's libraries.
+ */
+export async function verifyStripeWebhook(
+  secret: string,
+  signatureHeader: string | null,
+  body: string,
+  now = Date.now(),
+): Promise<boolean> {
+  if (!secret || !signatureHeader) return false;
+  let timestamp: string | null = null;
+  const signatures: string[] = [];
+  for (const part of signatureHeader.split(',')) {
+    const eq = part.indexOf('=');
+    if (eq <= 0) continue;
+    const key = part.slice(0, eq).trim();
+    const value = part.slice(eq + 1).trim();
+    if (!value) continue;
+    if (key === 't') timestamp = value;
+    else if (key === 'v1') signatures.push(value.toLowerCase());
+  }
+  if (!timestamp || !signatures.length) return false;
+  const ts = Number(timestamp);
+  if (!Number.isFinite(ts) || Math.abs(now / 1000 - ts) > 5 * 60) return false;
+  const expected = bytesToHex(await hmac(enc.encode(secret), `${timestamp}.${body}`));
+  return signatures.some((sig) => safeEqual(sig, expected));
 }
 
 /** Sign a value for the dashboard login cookie. */

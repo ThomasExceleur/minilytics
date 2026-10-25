@@ -30,6 +30,7 @@ export interface Site {
   currency: string;
   api_key: string;
   dodo_webhook_secret: string | null;
+  stripe_webhook_secret: string | null;
   created_at: number;
   visitors24h?: number;
   online?: number;

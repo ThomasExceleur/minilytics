@@ -5,6 +5,7 @@ import { handleEvent } from './collect';
 import { forgetSite, type AppEnv, type Site } from './env';
 import { passwordsMatch, randomId, signToken, verifyToken } from './lib/crypto';
 import { handleDodoWebhook, handleGoalApi, handlePaymentApi, rematchPayments } from './payments';
+import { handleStripeWebhook } from './stripe';
 import { breakdown, customers, funnel, makeCtx, overview, visitorProfile, visitors, type FunnelStep } from './stats';
 
 const app = new Hono<AppEnv>();
@@ -18,6 +19,7 @@ const LOCKOUT_MS = 15 * 60_000;
 app.use('/api/event', cors({ origin: '*', allowMethods: ['POST', 'OPTIONS'], maxAge: 86400 }));
 app.post('/api/event', handleEvent);
 app.post('/api/webhooks/dodo/:siteId', handleDodoWebhook);
+app.post('/api/webhooks/stripe/:siteId', handleStripeWebhook);
 app.post('/api/v1/payments', handlePaymentApi);
 app.post('/api/v1/goals', handleGoalApi);
 
@@ -106,7 +108,12 @@ function validTimezone(tz: string) {
   }
 }
 
-const publicSite = (s: Site) => ({ ...s, dodo_webhook_secret: s.dodo_webhook_secret ? '••••••••' : null });
+const mask = (secret: string | null) => (secret ? '••••••••' : null);
+const publicSite = (s: Site) => ({
+  ...s,
+  dodo_webhook_secret: mask(s.dodo_webhook_secret),
+  stripe_webhook_secret: mask(s.stripe_webhook_secret),
+});
 
 app.get('/api/sites', async (c) => {
   const now = Date.now();
@@ -141,12 +148,13 @@ app.post('/api/sites', async (c) => {
     currency: (b.currency || 'USD').toUpperCase().slice(0, 3),
     api_key: 'ml_' + randomId(16),
     dodo_webhook_secret: null,
+    stripe_webhook_secret: null,
     created_at: Date.now(),
   };
   await c.env.DB.prepare(
-    'INSERT INTO sites (id, name, domain, timezone, currency, api_key, dodo_webhook_secret, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+    'INSERT INTO sites (id, name, domain, timezone, currency, api_key, dodo_webhook_secret, stripe_webhook_secret, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
   )
-    .bind(site.id, site.name, site.domain, site.timezone, site.currency, site.api_key, null, site.created_at)
+    .bind(site.id, site.name, site.domain, site.timezone, site.currency, site.api_key, null, null, site.created_at)
     .run();
   return c.json(publicSite(site));
 });
@@ -171,8 +179,13 @@ app.patch('/api/sites/:id', async (c) => {
   if (typeof b.dodo_webhook_secret === 'string' && !b.dodo_webhook_secret.includes('•')) {
     next.dodo_webhook_secret = b.dodo_webhook_secret.trim() || null;
   }
-  await c.env.DB.prepare('UPDATE sites SET name = ?, domain = ?, timezone = ?, currency = ?, dodo_webhook_secret = ? WHERE id = ?')
-    .bind(next.name, next.domain, next.timezone, next.currency, next.dodo_webhook_secret, site.id)
+  if (typeof b.stripe_webhook_secret === 'string' && !b.stripe_webhook_secret.includes('•')) {
+    next.stripe_webhook_secret = b.stripe_webhook_secret.trim() || null;
+  }
+  await c.env.DB.prepare(
+    'UPDATE sites SET name = ?, domain = ?, timezone = ?, currency = ?, dodo_webhook_secret = ?, stripe_webhook_secret = ? WHERE id = ?',
+  )
+    .bind(next.name, next.domain, next.timezone, next.currency, next.dodo_webhook_secret, next.stripe_webhook_secret, site.id)
     .run();
   forgetSite(site.id);
   return c.json(publicSite(next));
@@ -187,7 +200,7 @@ app.post('/api/sites/:id/rotate-key', async (c) => {
 app.delete('/api/sites/:id', async (c) => {
   const id = c.get('site').id;
   await c.env.DB.batch(
-    ['events', 'sessions', 'visitors', 'payments', 'funnels'].map((t) =>
+    ['events', 'sessions', 'visitors', 'payments', 'payment_claims', 'funnels'].map((t) =>
       c.env.DB.prepare(`DELETE FROM ${t} WHERE site_id = ?`).bind(id),
     ).concat(c.env.DB.prepare('DELETE FROM sites WHERE id = ?').bind(id)),
   );

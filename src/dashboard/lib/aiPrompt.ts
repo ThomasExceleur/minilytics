@@ -34,6 +34,20 @@ The script stores two first-party cookies: \`ml_vid\` (visitor id) and \`ml_sid\
 - Make sure every checkout has a return/redirect URL on this site (e.g. return_url: 'https://${site.domain}/thanks' for checkout sessions, or ?redirect_url=... on payment links), and that page loads the Minilytics script. Dodo appends ?payment_id=... (or ?subscription_id=...) to it, and Minilytics uses that to link the payment to the visitor even if metadata is lost. Keep those query params on the URL (don't strip them before the page loads).
 - Do NOT touch Dodo webhooks in this codebase for Minilytics. I connect Dodo → Minilytics myself in the Dodo dashboard (webhook URL: ${origin}/api/webhooks/dodo/${site.id}).
 
+## Task 2b — Revenue attribution with Stripe (if this project charges with Stripe)
+Skip this task when the project does not use Stripe. If it does (search for "stripe", "checkout.sessions.create", "new Stripe"), do this instead of Task 2 for those code paths. The cookies are the same: \`ml_vid\` (visitor id) and \`ml_sid\` (session id).
+- Where a Checkout Session is created on the SERVER, read the cookies from the incoming request and MERGE them in (never drop existing metadata keys):
+    client_reference_id: <cookie ml_vid>   // the visitor id, not your own user id
+    metadata: { ...existingMetadata, ml_visitor_id: <cookie ml_vid> ?? '', ml_session_id: <cookie ml_sid> ?? '' }
+  Next.js App Router: const jar = await cookies(); from 'next/headers'.
+- When mode is 'subscription' (or the call already passes subscription_data), ALSO merge the same keys into subscription_data.metadata. Renewal invoices only carry the subscription's metadata, so without this only the first checkout can be linked:
+    subscription_data: { ...existingSubscriptionData, metadata: { ...existingSubscriptionMetadata, ml_visitor_id: <cookie ml_vid> ?? '', ml_session_id: <cookie ml_sid> ?? '' } }
+- When mode is 'payment', omit subscription_data (Stripe rejects it on one-off sessions).
+- success_url must be a page on this site that loads the script, and must include the literal session_id={CHECKOUT_SESSION_ID}. Example: https://${site.domain}/thanks?session_id={CHECKOUT_SESSION_ID}. Keep that query param on the URL (don't strip it before the page loads).
+- If the checkout request is made from the BROWSER, send window.minilytics.attribution() to your server and put those ids in metadata there. Do not append query params to an already-created checkout.stripe.com URL.
+- Static Payment Links (buy.stripe.com) need no change — the script sets client_reference_id on click.
+- Do NOT add a Stripe webhook in this codebase for Minilytics. I connect Stripe → Minilytics myself (endpoint ${origin}/api/webhooks/stripe/${site.id}, events checkout.session.completed, invoice.paid, charge.refunded).
+
 ## Task 3 — Identify logged-in users
 Right after a successful login/signup (and on app load when a user session exists), call:
   window.minilytics?.('identify', { user_id: user.id, email: user.email, name: user.name })
@@ -57,7 +71,7 @@ Always call it with optional chaining (window.minilytics?.(...)) so pages never 
 
 ## When you are done, reply with
 1. A list of every file you changed and why.
-2. Which checkout/payment code paths now send ml_visitor_id / ml_session_id (and any you could not find or were unsure about).
+2. Which checkout/payment code paths now send ml_visitor_id / ml_session_id (Dodo metadata and/or Stripe metadata, subscription_data.metadata and client_reference_id), and any you could not find or were unsure about.
 3. Which goals you added and where.
 4. How I can verify: open the site, in DevTools → Network a POST to ${origin}/api/event returns 202, and the visit appears in my Minilytics dashboard within seconds.`;
 }

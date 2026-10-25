@@ -163,9 +163,9 @@ Using Dodo **payment links**? The script adds `metadata_ml_visitor_id` / `metada
 
 **How credit is given:** a payment goes to the paying visitor's last visit that came from a real source (last non-direct
 touch). So "clicked a tweet, came back directly 17 days later and paid" is credited to the tweet. If metadata is
-missing, Minilytics tries, in order: the return page (`?payment_id=`), an earlier payment by the same customer
+missing, Minilytics tries, in order: the return page (`?payment_id=` or Stripe's `?session_id=`), an earlier payment by the same customer
 (renewals), an email you `identify()`'d, and finally checkout timing (used only when exactly one visitor clicked a Dodo
-checkout link in the 3 hours before the payment). The Journey tab shows how each payment was matched, and **Try
+or Stripe checkout link in the 3 hours before the payment). The Journey tab shows how each payment was matched, and **Try
 matching again** re-runs this for older payments.
 Refunds are subtracted from revenue.
 
@@ -175,6 +175,61 @@ Other providers can use the generic API (the key is in site settings):
 curl -X POST https://YOUR-HOST/api/v1/payments -H "Authorization: Bearer ml_..." -H "Content-Type: application/json" \
   -d '{"transaction_id":"txn_1","amount":29.99,"currency":"USD","visitor_id":"<ml_vid cookie>","email":"jane@acme.com"}'
 ```
+
+## Revenue attribution with Stripe
+
+Use this when you charge with Stripe Checkout (one-off or subscription). Dodo keeps working unchanged; a site can use either or both.
+
+1. In the Stripe Dashboard → **Developers → Webhooks → Add endpoint**, set the URL to
+   `https://YOUR-HOST/api/webhooks/stripe/SITE_ID` and subscribe to:
+
+   - `checkout.session.completed` — one-off Checkout payments, and the visitor id on the first subscription checkout
+   - `invoice.paid` — the first subscription charge and every renewal
+   - `charge.refunded` — full and partial refunds
+
+   If you take delayed payment methods (bank debits, for example), also add `checkout.session.async_payment_succeeded`.
+   Reveal the endpoint's **signing secret** (`whsec_…`) and paste it into the site's Settings. Minilytics checks the
+   `Stripe-Signature` header and rejects timestamps older or newer than 5 minutes. Stripe retries are safe: the same
+   payment or refund is stored once.
+
+2. Pass the visitor cookies into `stripe.checkout.sessions.create`. `metadata` links a one-off payment. For a
+   subscription, put the same keys in `subscription_data.metadata` — renewal invoices carry the subscription's metadata,
+   not the Checkout Session's. `client_reference_id` is a second copy of the visitor id (`ml_vid`, not your own user id).
+
+```ts
+import Stripe from 'stripe';
+import { cookies } from 'next/headers';
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!);
+const jar = await cookies();
+const visitorId = jar.get('ml_vid')?.value ?? '';
+const sessionId = jar.get('ml_sid')?.value ?? '';
+
+const session = await stripe.checkout.sessions.create({
+  mode: 'subscription', // 'payment' for a one-off — then omit subscription_data
+  line_items: [{ price: 'price_xxx', quantity: 1 }],
+  success_url: 'https://yoursite.com/thanks?session_id={CHECKOUT_SESSION_ID}',
+  cancel_url: 'https://yoursite.com/pricing',
+  client_reference_id: visitorId,
+  metadata: {
+    ml_visitor_id: visitorId,
+    ml_session_id: sessionId,
+  },
+  subscription_data: {
+    metadata: {
+      ml_visitor_id: visitorId,
+      ml_session_id: sessionId,
+    },
+  },
+});
+```
+
+`success_url` must be a page on your site that loads the tracking script, and it must keep
+`session_id={CHECKOUT_SESSION_ID}` (Stripe replaces the braces). That links the payment when metadata is missing.
+The same credit rules as Dodo apply, including the email / customer / timing fallbacks. Stripe Payment Links
+(`buy.stripe.com`) are tagged with `client_reference_id` by the script; don't rewrite `checkout.stripe.com` URLs.
+Set the site's revenue currency to the currency you charge in Stripe. Amounts are stored in Stripe's minor units
+(cents, for example) and are not converted.
 
 ## Accuracy notes
 
@@ -202,8 +257,8 @@ npm run smoke                         # end-to-end test against the running dev 
 
 ## How it's built
 
-- `public/js/script.js`: the tracker, 9 KB (about 3.5 KB gzipped). It handles cookies, pageviews, engaged time, goals, outbound links and Dodo link tagging
-- `src/worker`: a Hono app on Cloudflare Workers that handles event ingestion, the Dodo webhook, the payments and goals API, and stats queries on D1 (SQLite)
+- `public/js/script.js`: the tracker, about 9 KB. It handles cookies, pageviews, engaged time, goals, outbound links, Dodo link tagging and Stripe Payment Link tagging
+- `src/worker`: a Hono app on Cloudflare Workers that handles event ingestion, the Dodo and Stripe webhooks, the payments and goals API, and stats queries on D1 (SQLite)
 - `src/dashboard`: the React dashboard (Vite, Tailwind, Recharts), served as static files by the same Worker
 - `migrations/`: the database schema
 

@@ -269,7 +269,7 @@ function Journey({ search }: { search: string }) {
   const { data } = useApi<any[]>(`/api/sites/${site.id}/customers?${qs(q)}`, reloadKey + version);
   if (!data) return <div className="h-40 animate-pulse" />;
   if (!data.length)
-    return <div className="p-8 text-center text-sm text-stone-500">No payments in this period. Connect Dodo Payments in site settings to see who paid and where they came from.</div>;
+    return <div className="p-8 text-center text-sm text-stone-500">No payments in this period. Connect Dodo Payments or Stripe in site settings to see who paid and where they came from.</div>;
   const unmatched = data.filter((r) => !r.visitor_id).length;
   return (
     <div className="overflow-x-auto">

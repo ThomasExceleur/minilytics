@@ -24,6 +24,10 @@ interface PaymentInput {
   name?: string | null;
   subscriptionId?: string | null;
   renewal?: boolean;
+  paymentIntentId?: string | null;
+  checkoutSessionId?: string | null;
+  /** Other ids that may have been stored in payment_claims (Checkout Session id, invoice id, …). */
+  claimIds?: string[] | null;
 }
 
 export type MatchedBy = 'metadata' | 'return_page' | 'customer' | 'email' | 'timing';
@@ -40,7 +44,7 @@ export function creditedSessionSql() {
  *  2. return_page  the visitor landed on your return URL with ?payment_id=<this payment>
  *  3. customer   the same customer paid before (renewals)
  *  4. email      the email matches a visitor you identify()'d
- *  5. timing     exactly one visitor clicked a Dodo checkout link (or a checkout goal) shortly before the payment
+ *  5. timing     exactly one visitor clicked a checkout link (or a checkout goal) shortly before the payment
  * Credit goes to the last non-direct visit, so "saw a tweet, came back directly 17 days later and paid"
  * is credited to the tweet.
  */
@@ -50,9 +54,11 @@ async function attribute(db: D1Database, site: Site, p: PaymentInput) {
   let renewal = !!p.renewal;
 
   if (!visitorId) {
+    const claimKeys = [...new Set([p.id, p.subscriptionId, ...(p.claimIds ?? [])].filter((k): k is string => !!k))];
+    const placeholders = claimKeys.map(() => '?').join(',');
     const claim = await db
-      .prepare('SELECT visitor_id FROM payment_claims WHERE site_id = ? AND payment_id IN (?, ?) ORDER BY ts LIMIT 1')
-      .bind(site.id, p.id, p.subscriptionId ?? p.id)
+      .prepare(`SELECT visitor_id FROM payment_claims WHERE site_id = ? AND payment_id IN (${placeholders}) ORDER BY ts LIMIT 1`)
+      .bind(site.id, ...claimKeys)
       .first<{ visitor_id: string }>();
     if (claim) [visitorId, matchedBy] = [claim.visitor_id, 'return_page'];
   }
@@ -98,9 +104,9 @@ const TIMING_WINDOW_MS = 3 * 3_600_000;
 const MIN = 60_000;
 
 /**
- * Last resort when nothing identifies the buyer: look at who clicked a Dodo checkout link (or a checkout goal)
- * in the 3 hours before the payment. The strongest sign is coming back to the site right after paying
- * (Dodo redirects buyers to your return page); people who clicked Buy and gave up don't.
+ * Last resort when nothing identifies the buyer: look at who clicked a checkout link (Dodo, Stripe
+ * Checkout or a Stripe Payment Link) or a checkout goal in the 3 hours before the payment. The strongest
+ * sign is coming back to the site right after paying; people who clicked Buy and gave up don't.
  * Only ever picks a visitor when the evidence points to exactly one person.
  */
 async function matchByTiming(db: D1Database, site: Site, p: PaymentInput): Promise<{ visitorId: string | null; reason: string }> {
@@ -108,7 +114,7 @@ async function matchByTiming(db: D1Database, site: Site, p: PaymentInput): Promi
     .prepare(
       `SELECT e.visitor_id, MAX(e.ts) AS last_click FROM events e
        WHERE e.site_id = ? AND e.ts BETWEEN ? AND ?
-         AND ((e.type = 'outbound' AND e.name LIKE '%dodopayments.com%')
+         AND ((e.type = 'outbound' AND (e.name LIKE '%dodopayments.com%' OR e.name LIKE '%checkout.stripe.com%' OR e.name LIKE '%buy.stripe.com%'))
               OR (e.type = 'goal' AND (e.name LIKE '%checkout%' OR e.name LIKE '%buy%' OR e.name LIKE '%purchase%')))
          AND NOT EXISTS (SELECT 1 FROM payments o WHERE o.site_id = e.site_id AND o.visitor_id = e.visitor_id
                          AND o.kind = 'payment' AND o.id != ? AND o.ts BETWEEN ? AND ?)
@@ -169,6 +175,34 @@ export async function recordPayment(db: D1Database, site: Site, p: PaymentInput)
         renewal ? 1 : 0,
         matchedBy,
         p.subscriptionId ?? null,
+      ),
+    // A retry, or a second Stripe event for the same payment, may be the one that knows the visitor.
+    db
+      .prepare(
+        `UPDATE payments SET
+           visitor_id = COALESCE(visitor_id, ?),
+           session_id = COALESCE(session_id, ?),
+           matched_by = COALESCE(matched_by, ?),
+           email = COALESCE(email, ?),
+           name = COALESCE(name, ?),
+           customer_id = COALESCE(customer_id, ?),
+           subscription_id = COALESCE(subscription_id, ?),
+           payment_intent_id = COALESCE(payment_intent_id, ?),
+           checkout_session_id = COALESCE(checkout_session_id, ?)
+         WHERE site_id = ? AND id = ?`,
+      )
+      .bind(
+        visitorId,
+        sessionId,
+        matchedBy,
+        p.email ?? null,
+        p.name ?? null,
+        p.customerId ?? null,
+        p.subscriptionId ?? null,
+        p.paymentIntentId ?? null,
+        p.checkoutSessionId ?? null,
+        site.id,
+        p.id,
       ),
   ];
   // A payment tells us who an anonymous visitor really is.
