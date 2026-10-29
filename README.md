@@ -122,7 +122,10 @@ At 5–10k visitors a month you'll use a few percent of this. If you outgrow it,
 ```
 
 - **Button clicks / goals:** `<button data-ml-goal="signup_click">`, or `window.minilytics('goal', 'signup', { plan: 'pro' })`
-- **Identify logged-in users:** `window.minilytics('identify', { user_id, email, name })`
+- **Identify logged-in users:** `window.minilytics('identify', { user_id, email, name })`. When several visitors identify as the
+  same `user_id` (another browser, an app that sends its own events), they are merged into the oldest one, so funnels, profiles
+  and revenue see one person. A visitor keeps its first `user_id`: someone else signing in on a shared browser is ignored.
+- **Goal properties:** filter the dashboard by a goal, then split it by one of its properties (plan, placement…) in the Goals tab
 - **Ignore your own visits:** open `https://yoursite.com/?ml_ignore=true` once per browser
 - **Single-page apps** (Next.js, React Router…) are handled automatically
 - **Subdomains:** `app.yoursite.com` and `yoursite.com` share the same visitor, because the cookie is set on the root domain
@@ -174,6 +177,13 @@ Other providers can use the generic API (the key is in site settings):
 ```bash
 curl -X POST https://YOUR-HOST/api/v1/payments -H "Authorization: Bearer ml_..." -H "Content-Type: application/json" \
   -d '{"transaction_id":"txn_1","amount":29.99,"currency":"USD","visitor_id":"<ml_vid cookie>","email":"jane@acme.com"}'
+```
+
+Your backend can record goals too, with the visitor id or with your own user id (the visitor must have identify()'d as that user):
+
+```bash
+curl -X POST https://YOUR-HOST/api/v1/goals -H "Authorization: Bearer ml_..." -H "Content-Type: application/json" \
+  -d '{"user_id":"user_42","name":"first_request","props":{"plan":"pro"}}'
 ```
 
 ## Revenue attribution with Stripe
@@ -239,7 +249,10 @@ No analytics tool is 100% accurate. These are the main gaps and how this project
   rewrite). Payments are always recorded by the webhook, even when the visitor's browser blocked tracking.
 - **Safari** keeps cookies set by JavaScript for at most 7 days. A Safari visitor who returns after more than a week counts as new. The
   email fallback above recovers most of these payments.
-- **Bots** are filtered by user agent and the `navigator.webdriver` flag.
+- **Bots** are filtered by user agent and the `navigator.webdriver` flag. Bots that pass as a normal browser are dropped too:
+  referral spam domains (`src/worker/lib/bots.ts`), and page loads from hosting providers (AWS, Google Cloud, Azure, Alibaba…,
+  by network number). Only pageviews are checked for the network, so goals from an app running on a cloud desktop still count.
+  When the script is proxied, Cloudflare only sees the proxy, so the network check is skipped.
 - Revenue in a different currency than the site's is converted only when Dodo gives a settlement amount in the site's currency.
 
 ## Local development

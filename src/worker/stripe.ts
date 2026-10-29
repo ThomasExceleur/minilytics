@@ -1,5 +1,6 @@
 import type { Context } from 'hono';
 import { getSite, type AppEnv, type Site } from './env';
+import { resolveVisitor } from './identity';
 import { verifyStripeWebhook } from './lib/crypto';
 import { creditedSessionSql, recordPayment } from './payments';
 
@@ -44,6 +45,8 @@ export interface StripePaymentDraft {
   claimIds: string[];
   /** Ids that may point at the original payment of a refund. */
   refundOf: string[];
+  /** A subscription's billing cycle charge (not its first invoice), even for a customer Minilytics never saw pay. */
+  renewal?: boolean;
 }
 
 export interface StripeClaim {
@@ -250,6 +253,7 @@ function parseInvoice(obj: Record<string, unknown>, eventCreated: number, curren
         paymentIntentId,
         checkoutSessionId: null,
         claimIds: uniq([id, sub.id, paymentIntentId]),
+        renewal: reason === 'subscription_cycle',
       }),
     ],
   };
@@ -456,15 +460,19 @@ export async function handleStripeWebhook(c: Context<AppEnv>) {
   const db = c.env.DB;
   if (parsed.claims.length) {
     const now = Date.now();
+    // The checkout may carry the id of a visitor that has since been merged into another one.
+    const claims = await Promise.all(
+      parsed.claims.map(async (claim) => ({ ...claim, visitorId: await resolveVisitor(db, site.id, claim.visitorId) })),
+    );
     // Remember the visitor against every id this checkout mentioned, and link a payment that
     // arrived earlier without metadata (a trial's first paid invoice, for example).
     await db.batch([
-      ...parsed.claims.map((claim) =>
+      ...claims.map((claim) =>
         db
           .prepare('INSERT OR IGNORE INTO payment_claims (site_id, payment_id, visitor_id, ts) VALUES (?, ?, ?, ?)')
           .bind(site.id, claim.paymentId, claim.visitorId, now),
       ),
-      ...parsed.claims.map((claim) =>
+      ...claims.map((claim) =>
         db
           .prepare(
             `UPDATE payments SET visitor_id = ?, matched_by = COALESCE(matched_by, 'metadata'),
@@ -498,6 +506,7 @@ export async function handleStripeWebhook(c: Context<AppEnv>) {
       paymentIntentId: draft.paymentIntentId,
       checkoutSessionId: draft.checkoutSessionId,
       claimIds: draft.claimIds,
+      renewal: draft.renewal,
     });
   }
   return c.json({ ok: true });

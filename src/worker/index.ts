@@ -6,7 +6,7 @@ import { forgetSite, type AppEnv, type Site } from './env';
 import { passwordsMatch, randomId, signToken, verifyToken } from './lib/crypto';
 import { handleDodoWebhook, handleGoalApi, handlePaymentApi, rematchPayments } from './payments';
 import { handleStripeWebhook } from './stripe';
-import { breakdown, customers, funnel, makeCtx, overview, visitorProfile, visitors, type FunnelStep } from './stats';
+import { breakdown, customers, funnel, goalProps, makeCtx, overview, visitorProfile, visitors, type FunnelStep } from './stats';
 
 const app = new Hono<AppEnv>();
 const AUTH_COOKIE = 'ml_auth';
@@ -200,7 +200,7 @@ app.post('/api/sites/:id/rotate-key', async (c) => {
 app.delete('/api/sites/:id', async (c) => {
   const id = c.get('site').id;
   await c.env.DB.batch(
-    ['events', 'sessions', 'visitors', 'payments', 'payment_claims', 'funnels'].map((t) =>
+    ['events', 'sessions', 'visitors', 'visitor_aliases', 'payments', 'payment_claims', 'funnels'].map((t) =>
       c.env.DB.prepare(`DELETE FROM ${t} WHERE site_id = ?`).bind(id),
     ).concat(c.env.DB.prepare('DELETE FROM sites WHERE id = ?').bind(id)),
   );
@@ -214,11 +214,18 @@ app.get('/api/sites/:id/overview', async (c) => c.json(await overview(makeCtx(c)
 
 app.get('/api/sites/:id/breakdown', async (c) => {
   try {
-    return c.json(await breakdown(makeCtx(c), c.req.query('dim') ?? 'source', Number(c.req.query('limit')) || 100));
+    return c.json(
+      await breakdown(makeCtx(c), c.req.query('dim') ?? 'source', Number(c.req.query('limit')) || 100, {
+        goal: c.req.query('goal'),
+        prop: c.req.query('prop'),
+      }),
+    );
   } catch (e) {
     return c.json({ error: (e as Error).message }, 400);
   }
 });
+
+app.get('/api/sites/:id/goal-props', async (c) => c.json(await goalProps(makeCtx(c), c.req.query('goal') ?? '')));
 
 app.post('/api/sites/:id/rematch', async (c) => c.json(await rematchPayments(c.env.DB, c.get('site'))));
 app.get('/api/sites/:id/customers', async (c) => c.json(await customers(makeCtx(c))));

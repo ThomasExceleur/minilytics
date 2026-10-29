@@ -1,5 +1,6 @@
 import type { Context } from 'hono';
 import { getSite, type AppEnv, type Site } from './env';
+import { resolveVisitor, visitorForUser } from './identity';
 import { verifyStandardWebhook } from './lib/crypto';
 
 export function currencyDecimals(currency: string): number {
@@ -49,7 +50,7 @@ export function creditedSessionSql() {
  * is credited to the tweet.
  */
 async function attribute(db: D1Database, site: Site, p: PaymentInput) {
-  let visitorId = p.visitorId ?? null;
+  let visitorId = p.visitorId ? await resolveVisitor(db, site.id, p.visitorId) : null;
   let matchedBy: MatchedBy | null = visitorId ? 'metadata' : null;
   let renewal = !!p.renewal;
 
@@ -381,9 +382,13 @@ export async function handleGoalApi(c: Context<AppEnv>) {
   const site = await siteFromApiKey(c);
   if (!site) return c.json({ error: 'invalid api key' }, 401);
   const b = await c.req.json<Record<string, unknown>>().catch(() => null);
-  const vid = str(b?.visitor_id);
   const name = str(b?.name)?.slice(0, 64);
-  if (!vid || !name) return c.json({ error: 'visitor_id and name are required' }, 400);
+  const userId = str(b?.user_id)?.slice(0, 128) ?? null;
+  const rawVid = str(b?.visitor_id);
+  if ((!rawVid && !userId) || !name) return c.json({ error: 'visitor_id (or user_id) and name are required' }, 400);
+  // Your backend may only know its own user id: use the visitor that identify()'d as that user.
+  const vid = rawVid ? await resolveVisitor(c.env.DB, site.id, rawVid) : await visitorForUser(c.env.DB, site.id, userId!);
+  if (!vid) return c.json({ error: 'visitor not found' }, 404);
   const s = await c.env.DB.prepare(
     'SELECT id, exit_page FROM sessions WHERE site_id = ? AND visitor_id = ? ORDER BY started_at DESC LIMIT 1',
   )

@@ -261,6 +261,14 @@ describe('Stripe event parsing', () => {
     expect(pay({ type: 'invoice.paid', data: { object: { id: 'in_open', status: 'open', amount_paid: 500, currency: 'eur', billing_reason: 'subscription_cycle', subscription: 'sub_x' } } })).toEqual([]);
   });
 
+  it('marks billing cycle invoices as renewals, even for a customer never seen paying', () => {
+    expect(pay(invoicePaid)[0].renewal).toBe(false);
+    const cycle = { ...invoicePaid, data: { object: { ...invoicePaid.data.object, id: 'in_cycle', billing_reason: 'subscription_cycle' } } };
+    expect(pay(cycle)[0]).toMatchObject({ id: 'in_cycle', renewal: true });
+    const upgrade = { ...invoicePaid, data: { object: { ...invoicePaid.data.object, id: 'in_up', billing_reason: 'subscription_update' } } };
+    expect(pay(upgrade)[0].renewal).toBe(false);
+  });
+
   it('reads visitor ids copied onto invoice line metadata', () => {
     const [row] = pay({
       type: 'invoice.paid',

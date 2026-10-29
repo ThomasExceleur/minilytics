@@ -2,6 +2,7 @@ import { createHmac } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import { classify } from '../src/shared/sources';
 import { belongsTo, normalizePath } from '../src/worker/collect';
+import { isDatacenter, isSpamReferrer } from '../src/worker/lib/bots';
 import { verifyStandardWebhook } from '../src/worker/lib/crypto';
 import { bucketLabels, resolveRange, startOfDay, tzOffset } from '../src/worker/lib/time';
 import { isBot, parseUA } from '../src/worker/lib/ua';
@@ -98,5 +99,26 @@ describe('Standard Webhooks (Dodo)', () => {
   it('rejects tampering and stale timestamps', async () => {
     expect(await verifyStandardWebhook(secret, { id: 'msg_1', timestamp: ts, signature: `v1,${sig}` }, body + ' ')).toBe(false);
     expect(await verifyStandardWebhook(secret, { id: 'msg_1', timestamp: String(Number(ts) - 3600), signature: `v1,${sig}` }, body)).toBe(false);
+  });
+});
+
+describe('bot traffic', () => {
+  it('spots referral spam domains and their subdomains, not lookalikes', () => {
+    expect(isSpamReferrer('https://aocr.org/')).toBe(true);
+    expect(isSpamReferrer('https://www.aocr.org/some/page')).toBe(true);
+    expect(isSpamReferrer('https://blog.aocr.org')).toBe(true);
+    expect(isSpamReferrer('https://notaocr.org')).toBe(false);
+    expect(isSpamReferrer('https://www.google.com/')).toBe(false);
+    expect(isSpamReferrer('')).toBe(false);
+    expect(isSpamReferrer(undefined)).toBe(false);
+    expect(isSpamReferrer('android-app://com.google.android.gm')).toBe(false);
+  });
+  it('flags hosting providers but not home networks or privacy relays', () => {
+    expect(isDatacenter(16509)).toBe(true); // AWS
+    expect(isDatacenter(45102)).toBe(true); // Alibaba Cloud
+    expect(isDatacenter(3215)).toBe(false); // Orange
+    expect(isDatacenter(13335)).toBe(false); // Cloudflare (WARP, iCloud Private Relay)
+    expect(isDatacenter(null)).toBe(false);
+    expect(isDatacenter('16509')).toBe(false);
   });
 });

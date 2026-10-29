@@ -174,6 +174,71 @@ assert(!c5.visitor_id, 'ambiguous timing is not guessed');
 const rm = (await call(`/api/sites/${site.id}/rematch`, { method: 'POST' })).body;
 assert(rm.checked === 1 && rm.matched === 0 && /too close to call/.test(rm.details[0].reason), `rematch explains: "${rm.details?.[0]?.reason}"`);
 
+// --- Referral spam is dropped like other bots ---
+const visitorsBefore = (await call(`/api/sites/${site.id}/overview?period=today`)).body.current.visitors;
+r = await event(site.id, { t: 'pageview', u: 'https://smoke-test.com/blog/guide', r: 'https://aocr.org/', vid: crypto.randomUUID(), sid: crypto.randomUUID() });
+const visitorsAfter = (await call(`/api/sites/${site.id}/overview?period=today`)).body.current.visitors;
+assert(r.status === 202 && visitorsAfter === visitorsBefore, 'referral spam silently dropped');
+
+// --- One person, several visitors: the website, then an app that sends its own events ---
+const web = { vid: crypto.randomUUID(), sid: crypto.randomUUID() };
+const app = { vid: crypto.randomUUID(), sid: crypto.randomUUID() };
+await event(site.id, { t: 'pageview', u: 'https://smoke-test.com/blog/guide', r: 'https://www.google.com/', ...web });
+await event(site.id, { t: 'identify', u: 'https://smoke-test.com/blog/guide', p: { user_id: 'user_42', email: 'Sam@Example.com' }, ...web });
+await event(site.id, { t: 'goal', u: 'https://addin.smoke-test.com/chat', n: 'addin_first_open', ...app });
+await event(site.id, { t: 'identify', u: 'https://addin.smoke-test.com/chat', p: { user_id: 'user_42', email: 'sam@example.com' }, ...app });
+// Sent with the old visitor id after the merge: recorded under the kept visitor.
+await event(site.id, { t: 'goal', u: 'https://addin.smoke-test.com/chat', n: 'addin_subscribe_click_paywall', p: { target: 'pricing', platform: 'PC' }, ...app });
+let sam = (await call(`/api/sites/${site.id}/visitors/${app.vid}`)).body;
+assert(sam.visitor.id === web.vid && sam.sessions.length === 2 && sam.events.length === 3, `app visitor merged into the oldest visitor of the user (${sam.events.length} events)`);
+const merge = (await call(`/api/sites/${site.id}/funnels`, { method: 'POST', body: JSON.stringify({ name: 'App', steps: [{ type: 'page', value: '/blog/guide' }, { type: 'goal', value: 'addin_first_open' }, { type: 'goal', value: 'addin_subscribe_click_paywall' }] }) })).body;
+const ms = (await call(`/api/sites/${site.id}/funnels/${merge.id}/stats?period=today`)).body;
+assert(ms.map((s) => s.visitors).join(',') === '1,1,1', `funnel follows one person across site and app (got ${ms.map((s) => s.visitors)})`);
+
+// Someone else signing in on the same browser does not take the visitor over.
+await event(site.id, { t: 'identify', u: 'https://smoke-test.com/', p: { user_id: 'user_99', email: 'other@example.com' }, ...web });
+sam = (await call(`/api/sites/${site.id}/visitors/${web.vid}`)).body;
+assert(sam.visitor.user_id === 'user_42' && sam.visitor.email === 'sam@example.com', 'second user on a shared browser ignored');
+
+// --- Server-side goals with your own user id ---
+const goalApi = (body) => fetch(BASE + '/api/v1/goals', { method: 'POST', headers: { authorization: `Bearer ${site.api_key}`, 'content-type': 'application/json' }, body: JSON.stringify(body) });
+assert((await goalApi({ user_id: 'user_42', name: 'addin_request_1', props: { mode: 'premium' } })).status === 200, 'goals API accepts user_id');
+assert((await goalApi({ user_id: 'nobody', name: 'addin_request_1' })).status === 404, 'goals API: unknown user_id is 404');
+assert((await goalApi({ visitor_id: app.vid, name: 'addin_request_5' })).status === 200, 'goals API resolves a merged visitor id');
+sam = (await call(`/api/sites/${site.id}/visitors/${web.vid}`)).body;
+assert(sam.events.filter((e) => e.name?.startsWith('addin_request_')).length === 2, 'server-side goals land on the person');
+
+// --- Goals split by one of their properties ---
+const keys = (await call(`/api/sites/${site.id}/goal-props?period=today&goal=addin_subscribe_click_paywall`)).body;
+assert(keys.includes('target') && keys.includes('platform'), `goal property names listed (${keys})`);
+assert((await call(`/api/sites/${site.id}/breakdown?period=today&dim=prop&goal=x`)).status === 400, 'dim=prop needs a property');
+
+// --- Stripe: a merged visitor id in metadata, and a renewal of a customer never seen before ---
+const whsec = 'whsec_smoke_' + crypto.randomBytes(8).toString('hex');
+await call(`/api/sites/${site.id}`, { method: 'PATCH', body: JSON.stringify({ stripe_webhook_secret: whsec }) });
+const stripe = (evt) => {
+  const body = JSON.stringify(evt);
+  const ts = Math.floor(Date.now() / 1000);
+  const sig = crypto.createHmac('sha256', whsec).update(`${ts}.${body}`).digest('hex');
+  return fetch(`${BASE}/api/webhooks/stripe/${site.id}`, { method: 'POST', headers: { 'stripe-signature': `t=${ts},v1=${sig}`, 'content-type': 'application/json' }, body });
+};
+const invoice = (id, reason, customer, email, metadata) => ({
+  id: 'evt_' + id, type: 'invoice.paid', created: Math.floor(Date.now() / 1000),
+  data: { object: {
+    id, object: 'invoice', status: 'paid', amount_paid: 2900, currency: 'usd', billing_reason: reason, customer, customer_email: email,
+    parent: { type: 'subscription_details', subscription_details: { subscription: 'sub_' + id, metadata } },
+    status_transitions: { paid_at: Math.floor(Date.now() / 1000) },
+  } },
+});
+assert((await stripe(invoice('in_sam', 'subscription_create', 'cus_sam', 'sam@example.com', { ml_visitor_id: app.vid }))).status === 200, 'stripe invoice accepted');
+assert((await stripe(invoice('in_old', 'subscription_cycle', 'cus_old', 'old@example.com', {}))).status === 200, 'stripe renewal accepted');
+const journey = (await call(`/api/sites/${site.id}/customers?period=today`)).body;
+const samPay = journey.find((c) => c.id === 'in_sam');
+assert(samPay.visitor_id === web.vid && samPay.matched_by === 'metadata' && samPay.renewal === 0 && samPay.source === 'Google', 'checkout with a merged visitor id credits the person and their Google visit');
+assert(journey.find((c) => c.id === 'in_old').renewal === 1, 'billing cycle invoice of an unknown customer is a renewal');
+const byPlatform = (await call(`/api/sites/${site.id}/breakdown?period=today&dim=prop&goal=addin_subscribe_click_paywall&prop=platform`)).body;
+assert(byPlatform.length === 1 && byPlatform[0].label === 'PC' && byPlatform[0].visitors === 1 && byPlatform[0].revenue === 2900, 'goal split by property, with revenue');
+
 for (const p of ['today', 'yesterday', '24h', '48h', '7d', '30d', '90d', '12m', 'all']) {
   const res = await call(`/api/sites/${site.id}/overview?period=${p}`);
   assert(res.status === 200 && res.body.series.length > 0, `period ${p} (${res.body.series.length} buckets, ${res.body.range.granularity})`);
