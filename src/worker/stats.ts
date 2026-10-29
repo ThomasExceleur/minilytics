@@ -1,5 +1,6 @@
 import type { Context } from 'hono';
 import type { AppEnv, Site } from './env';
+import { resolveVisitor } from './identity';
 import { bucketLabels, bucketSql, resolveRange, tzOffset, type Range } from './lib/time';
 import { currencyDecimals } from './payments';
 
@@ -231,7 +232,10 @@ export interface BreakdownRow {
   extra?: string | null;
 }
 
-export async function breakdown(ctx: Ctx, dim: string, limit = 100): Promise<BreakdownRow[]> {
+// Goal properties are stored as JSON clipped to 1000 characters, so a long one can be cut mid-way.
+const GOAL_PROPS = `json_each(CASE WHEN json_valid(e.props) THEN e.props ELSE '{}' END)`;
+
+export async function breakdown(ctx: Ctx, dim: string, limit = 100, opts: { goal?: string; prop?: string } = {}): Promise<BreakdownRow[]> {
   const { db } = ctx;
   const lim = Math.max(1, Math.min(500, limit));
 
@@ -316,7 +320,47 @@ export async function breakdown(ctx: Ctx, dim: string, limit = 100): Promise<Bre
     return merge(v.results as any[], r.results as any[]);
   }
 
+  // One goal's completions split by the value of one of its properties, e.g. signup_click by plan.
+  if (dim === 'prop') {
+    if (!opts.goal || !opts.prop) throw new Error('dim=prop needs goal and prop');
+    const f = filterSql(ctx.filters);
+    const join = hasFilters(ctx.filters) ? 'JOIN sessions s ON s.site_id = e.site_id AND s.id = e.session_id' : '';
+    const params = [ctx.site.id, opts.goal, ctx.range.from, ctx.range.to, opts.prop, ...f.params];
+    const base = `FROM events e ${join}, ${GOAL_PROPS} gp
+      WHERE e.site_id = ? AND e.type = 'goal' AND e.name = ? AND e.ts >= ? AND e.ts < ? AND gp.key = ?${f.sql}`;
+    const [v, r] = await db.batch([
+      db
+        .prepare(
+          `SELECT CAST(gp.value AS TEXT) AS label, COUNT(DISTINCT e.visitor_id) AS visitors, COUNT(*) AS pageviews ${base}
+           GROUP BY label ORDER BY visitors DESC LIMIT ${lim}`,
+        )
+        .bind(...params),
+      db
+        .prepare(
+          `SELECT g.label, SUM(p.amount) AS revenue, COUNT(DISTINCT p.visitor_id) AS customers
+           FROM (SELECT DISTINCT CAST(gp.value AS TEXT) AS label, e.visitor_id ${base}) g
+           JOIN payments p ON p.site_id = ? AND p.visitor_id = g.visitor_id AND p.ts >= ? AND p.ts < ?
+           GROUP BY g.label`,
+        )
+        .bind(...params, ctx.site.id, ctx.range.from, ctx.range.to),
+    ]);
+    return merge(v.results as any[], r.results as any[]);
+  }
+
   throw new Error(`unknown dimension ${dim}`);
+}
+
+/** Property names sent with a goal in the period, most used first. */
+export async function goalProps(ctx: Ctx, goal: string): Promise<string[]> {
+  const res = await ctx.db
+    .prepare(
+      `SELECT gp.key AS key, COUNT(*) AS n FROM events e, ${GOAL_PROPS} gp
+       WHERE e.site_id = ? AND e.type = 'goal' AND e.name = ? AND e.ts >= ? AND e.ts < ?
+       GROUP BY gp.key ORDER BY n DESC LIMIT 50`,
+    )
+    .bind(ctx.site.id, goal, ctx.range.from, ctx.range.to)
+    .all<{ key: string }>();
+  return res.results.map((r) => r.key);
 }
 
 function merge(visits: any[], revenue: any[]): BreakdownRow[] {
@@ -378,6 +422,8 @@ export async function visitors(ctx: Ctx) {
 
 /** Everything one visitor did: visits, pages, clicks, payments. */
 export async function visitorProfile(db: D1Database, site: Site, vid: string) {
+  // Links saved before two visitors were merged still open the merged profile.
+  vid = await resolveVisitor(db, site.id, vid);
   const [v, s, e, p] = await db.batch([
     db.prepare('SELECT * FROM visitors WHERE site_id = ? AND id = ?').bind(site.id, vid),
     db.prepare('SELECT * FROM sessions WHERE site_id = ? AND visitor_id = ? ORDER BY started_at DESC LIMIT 100').bind(site.id, vid),

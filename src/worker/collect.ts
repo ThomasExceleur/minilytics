@@ -1,6 +1,8 @@
 import type { Context } from 'hono';
 import { classify } from '../shared/sources';
 import { getSite, type AppEnv, type Site } from './env';
+import { mergeUserVisitors, resolveVisitor } from './identity';
+import { isDatacenter, isSpamReferrer } from './lib/bots';
 import { isBot, parseUA } from './lib/ua';
 import { creditedSessionSql } from './payments';
 
@@ -71,7 +73,13 @@ export async function handleEvent(c: Context<AppEnv>) {
   // Only accept data for the site's own domain, so nobody can pollute your stats from elsewhere.
   if (!belongsTo(url.hostname, site.domain)) return c.body(null, 403);
 
-  await ingest(c.env.DB, site, body, url, ua, geoOf(c), Date.now());
+  // Bots with a normal browser user agent: referral spam, and page loads from hosting providers.
+  // Only pageviews are checked for the network, so goals sent by apps from a cloud desktop still count.
+  const geo = geoOf(c);
+  if (isSpamReferrer(body.r)) return c.body(null, 202);
+  if (body.t === 'pageview' && isDatacenter(geo.asn)) return c.body(null, 202);
+
+  await ingest(c.env.DB, site, body, url, ua, geo, Date.now());
   return c.body(null, 202);
 }
 
@@ -79,6 +87,8 @@ export interface Geo {
   country: string | null;
   region: string | null;
   city: string | null;
+  /** Network the visitor browses from; null when a proxy sits in between and Cloudflare only sees the proxy. */
+  asn: number | null;
 }
 
 /**
@@ -95,10 +105,17 @@ function geoOf(c: Context<AppEnv>): Geo {
     }
   };
   if (h('x-vercel-ip-country')) {
-    return { country: h('x-vercel-ip-country'), region: h('x-vercel-ip-country-region'), city: h('x-vercel-ip-city') };
+    return { country: h('x-vercel-ip-country'), region: h('x-vercel-ip-country-region'), city: h('x-vercel-ip-city'), asn: null };
   }
   const cf = (c.req.raw as { cf?: IncomingRequestCfProperties }).cf;
-  return { country: (cf?.country as string) ?? null, region: (cf?.region as string) ?? null, city: (cf?.city as string) ?? null };
+  // Behind another proxy, Cloudflare sees the proxy's network (often a cloud provider), not the visitor's.
+  const proxied = !!(h('x-forwarded-host') || h('x-nf-client-connection-ip'));
+  return {
+    country: (cf?.country as string) ?? null,
+    region: (cf?.region as string) ?? null,
+    city: (cf?.city as string) ?? null,
+    asn: !proxied && typeof cf?.asn === 'number' ? cf.asn : null,
+  };
 }
 
 export async function ingest(
@@ -111,6 +128,8 @@ export async function ingest(
   now: number,
 ) {
   const path = normalizePath(url.pathname);
+  // Events from a visitor that was merged into another one are recorded under the kept visitor.
+  if (body.t !== 'ping') body = { ...body, vid: await resolveVisitor(db, site.id, body.vid) };
   const { t, vid, sid } = body;
 
   if (t === 'ping') {
@@ -124,14 +143,24 @@ export async function ingest(
 
   if (t === 'identify') {
     const p = body.p ?? {};
+    const userId = clip(p.user_id, 128);
+    if (userId) {
+      const current = await db
+        .prepare('SELECT user_id FROM visitors WHERE site_id = ? AND id = ?')
+        .bind(site.id, vid)
+        .first<{ user_id: string | null }>();
+      // Someone else signed in on a shared browser: the visitor stays with its first user.
+      if (current?.user_id && current.user_id !== userId) return;
+    }
     await db.batch([
       db.prepare('INSERT OR IGNORE INTO visitors (site_id, id, first_seen) VALUES (?, ?, ?)').bind(site.id, vid, now),
       db
         .prepare(
           'UPDATE visitors SET user_id = COALESCE(?, user_id), email = COALESCE(?, email), name = COALESCE(?, name) WHERE site_id = ? AND id = ?',
         )
-        .bind(clip(p.user_id, 128), clip(p.email, 200)?.toLowerCase() ?? null, clip(p.name, 128), site.id, vid),
+        .bind(userId, clip(p.email, 200)?.toLowerCase() ?? null, clip(p.name, 128), site.id, vid),
     ]);
+    if (userId) await mergeUserVisitors(db, site.id, userId, now);
     return;
   }
 
@@ -265,8 +294,8 @@ function newSession(
       .prepare(
         `INSERT OR IGNORE INTO sessions (site_id, id, visitor_id, started_at, last_seen_at, pageviews, hostname, entry_page, exit_page,
           referrer, referrer_domain, source, channel, utm_source, utm_medium, utm_campaign, utm_term, utm_content, ref,
-          country, region, city, browser, os, device)
-         VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          country, region, city, browser, os, device, asn)
+         VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .bind(
         site.id,
@@ -293,6 +322,7 @@ function newSession(
         browser,
         os,
         device,
+        geo.asn,
       ),
     // Separate statement so concurrent first events (pageview + goal racing) never double count.
     ...(pageviews

@@ -36,6 +36,7 @@ function Goals({ totalVisitors }: { totalVisitors: number }) {
   const { site, q, reloadKey, money, addFilter } = useDash();
   const { data } = useApi<BreakdownRow[]>(`/api/sites/${site.id}/breakdown?${qs(q, { dim: 'goal' })}`, reloadKey);
   if (!data) return <div className="h-40 animate-pulse" />;
+  const goalFilter = q.filters.goal;
   if (!data.length)
     return (
       <div className="p-8 text-center text-sm text-stone-500">
@@ -44,28 +45,82 @@ function Goals({ totalVisitors }: { totalVisitors: number }) {
       </div>
     );
   return (
-    <table className="w-full text-sm">
-      <thead>
-        <tr className="text-left text-stone-500">
-          <th className="px-3 pb-2 font-medium">Goal</th>
-          <th className="pb-2 text-right font-medium">Visitors</th>
-          <th className="pb-2 text-right font-medium">Completions</th>
-          <th className="pb-2 text-right font-medium">Conversion</th>
-          <th className="px-3 pb-2 text-right font-medium">Revenue</th>
-        </tr>
-      </thead>
-      <tbody>
-        {data.map((g) => (
-          <tr key={g.label} className="cursor-pointer border-t border-stone-100 hover:bg-stone-50" onClick={() => addFilter('goal', g.label ?? '')} title="Filter by visitors who completed this goal">
-            <td className="px-3 py-2.5 font-medium">🎯 {g.label}</td>
-            <td className="py-2.5 text-right">{fmtNumber(g.visitors)}</td>
-            <td className="py-2.5 text-right">{fmtNumber(g.pageviews ?? 0)}</td>
-            <td className="py-2.5 text-right">{totalVisitors ? fmtPct(g.visitors / totalVisitors, 1) : '—'}</td>
-            <td className="px-3 py-2.5 text-right">{money(g.revenue)}</td>
+    <>
+      <table className="w-full text-sm">
+        <thead>
+          <tr className="text-left text-stone-500">
+            <th className="px-3 pb-2 font-medium">Goal</th>
+            <th className="pb-2 text-right font-medium">Visitors</th>
+            <th className="pb-2 text-right font-medium">Completions</th>
+            <th className="pb-2 text-right font-medium">Conversion</th>
+            <th className="px-3 pb-2 text-right font-medium">Revenue</th>
           </tr>
-        ))}
-      </tbody>
-    </table>
+        </thead>
+        <tbody>
+          {data.map((g) => (
+            <tr key={g.label} className="cursor-pointer border-t border-stone-100 hover:bg-stone-50" onClick={() => addFilter('goal', g.label ?? '')} title="Filter by visitors who completed this goal">
+              <td className="px-3 py-2.5 font-medium">🎯 {g.label}</td>
+              <td className="py-2.5 text-right">{fmtNumber(g.visitors)}</td>
+              <td className="py-2.5 text-right">{fmtNumber(g.pageviews ?? 0)}</td>
+              <td className="py-2.5 text-right">{totalVisitors ? fmtPct(g.visitors / totalVisitors, 1) : '—'}</td>
+              <td className="px-3 py-2.5 text-right">{money(g.revenue)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {goalFilter && <GoalProps goal={goalFilter} />}
+    </>
+  );
+}
+
+/** With a goal filter on, splits that goal by the value of one of its properties (plan, placement…). */
+function GoalProps({ goal }: { goal: string }) {
+  const { site, q, reloadKey, money } = useDash();
+  const { data: keys } = useApi<string[]>(`/api/sites/${site.id}/goal-props?${qs(q, { goal })}`, reloadKey);
+  const [picked, setPicked] = useState('');
+  const prop = keys?.includes(picked) ? picked : keys?.[0] ?? '';
+  const { data } = useApi<BreakdownRow[]>(
+    prop ? `/api/sites/${site.id}/breakdown?${qs(q, { dim: 'prop', goal, prop })}` : null,
+    reloadKey,
+  );
+  if (!keys?.length) return null;
+  return (
+    <div className="mt-4 border-t border-stone-100 pt-3">
+      <div className="flex items-center gap-2 px-3 pb-2 text-sm text-stone-500">
+        🎯 {goal} by
+        <select className="input w-auto py-1.5" value={prop} onChange={(e) => setPicked(e.target.value)}>
+          {keys.map((k) => (
+            <option key={k} value={k}>
+              {k}
+            </option>
+          ))}
+        </select>
+      </div>
+      {!data ? (
+        <div className="h-20 animate-pulse" />
+      ) : (
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="text-left text-stone-500">
+              <th className="px-3 pb-2 font-medium">{prop}</th>
+              <th className="pb-2 text-right font-medium">Visitors</th>
+              <th className="pb-2 text-right font-medium">Completions</th>
+              <th className="px-3 pb-2 text-right font-medium">Revenue</th>
+            </tr>
+          </thead>
+          <tbody>
+            {data.map((r) => (
+              <tr key={r.label ?? ''} className="border-t border-stone-100">
+                <td className="px-3 py-2.5 font-medium">{r.label ?? '(none)'}</td>
+                <td className="py-2.5 text-right">{fmtNumber(r.visitors)}</td>
+                <td className="py-2.5 text-right">{fmtNumber(r.pageviews ?? 0)}</td>
+                <td className="px-3 py-2.5 text-right">{money(r.revenue)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
   );
 }
 
